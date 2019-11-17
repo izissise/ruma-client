@@ -93,16 +93,17 @@ use futures_core::{
     stream::{Stream, TryStream},
 };
 use futures_util::stream;
-use http::Response as HttpResponse;
-use hyper::{client::HttpConnector, Client as HyperClient, Uri};
-#[cfg(feature = "hyper-tls")]
-use hyper_tls::HttpsConnector;
+use http::{Request as HttpRequest, Response as HttpResponse, Uri};
 use ruma_api::{Endpoint, Outgoing};
+use std::pin::Pin;
 use url::Url;
 
 use crate::error::InnerError;
 
-pub use crate::{error::Error, session::Session};
+pub use crate::{
+    error::{Error, HttpRequesterError},
+    session::Session,
+};
 pub use ruma_client_api as api;
 pub use ruma_events as events;
 pub use ruma_identifiers as identifiers;
@@ -112,30 +113,52 @@ pub use ruma_identifiers as identifiers;
 mod error;
 mod session;
 
+// https://users.rust-lang.org/t/solved-is-it-possible-to-run-async-code-in-a-trait-method-with-stdfuture-async-await/24874/6
+/// The trait for which the implementation will do the actual http request
+pub trait HttpRequester {
+    /// Consume the request
+    fn request(
+        &self,
+        req: HttpRequest<Vec<u8>>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<HttpResponse<Vec<u8>>, error::HttpRequesterError>>
+                + Send
+                + '_,
+        >,
+    >;
+}
+
 /// A client for the Matrix client-server API.
 #[derive(Debug)]
-pub struct Client<C>(Arc<ClientData<C>>);
+pub struct Client<C: HttpRequester>(Arc<ClientData<C>>);
 
 /// Data contained in Client's Rc
 #[derive(Debug)]
-struct ClientData<C> {
+struct ClientData<C>
+where
+    C: HttpRequester,
+{
     /// The URL of the homeserver to connect to.
     homeserver_url: Url,
     /// The underlying HTTP client.
-    hyper: HyperClient<C>,
+    http_client: C,
     /// User session data.
     session: Mutex<Option<Session>>,
 }
 
-/// Non-secured variant of the client (using plain HTTP requests)
-pub type HttpClient = Client<HttpConnector>;
-
-impl HttpClient {
-    /// Creates a new client for making HTTP requests to the given homeserver.
-    pub fn new(homeserver_url: Url, session: Option<Session>) -> Self {
+impl<C> Client<C>
+where
+    C: HttpRequester + 'static,
+{
+    /// Creates a new client using the given `HttpRequester`.
+    ///
+    /// This allows the user to configure the details of HTTP as desired.
+    /// And to pass a session if one already exist with the homeserver
+    pub fn new(http_client: C, homeserver_url: Url, session: Option<Session>) -> Self {
         Self(Arc::new(ClientData {
             homeserver_url,
-            hyper: HyperClient::builder().keep_alive(true).build_http(),
+            http_client: http_client,
             session: Mutex::new(session),
         }))
     }
@@ -149,44 +172,6 @@ impl HttpClient {
             .lock()
             .expect("session mutex was poisoned")
             .clone()
-    }
-}
-
-/// Secured variant of the client (using HTTPS requests)
-#[cfg(feature = "tls")]
-pub type HttpsClient = Client<HttpsConnector<HttpConnector>>;
-
-#[cfg(feature = "tls")]
-impl HttpsClient {
-    /// Creates a new client for making HTTPS requests to the given homeserver.
-    pub fn https(homeserver_url: Url, session: Option<Session>) -> Self {
-        let connector = HttpsConnector::new();
-
-        Self(Arc::new(ClientData {
-            homeserver_url,
-            hyper: HyperClient::builder().keep_alive(true).build(connector),
-            session: Mutex::new(session),
-        }))
-    }
-}
-
-impl<C> Client<C>
-where
-    C: hyper::client::connect::Connect + Clone + Send + Sync + 'static,
-{
-    /// Creates a new client using the given `hyper::Client`.
-    ///
-    /// This allows the user to configure the details of HTTP as desired.
-    pub fn custom(
-        hyper_client: HyperClient<C>,
-        homeserver_url: Url,
-        session: Option<Session>,
-    ) -> Self {
-        Self(Arc::new(ClientData {
-            homeserver_url,
-            hyper: hyper_client,
-            session: Mutex::new(session),
-        }))
     }
 
     /// Log in with a username and password.
@@ -371,42 +356,31 @@ where
         let mut url = client.homeserver_url.clone();
 
         async move {
-            let mut hyper_request = request.try_into()?.map(hyper::Body::from);
-
-            {
-                let uri = hyper_request.uri();
-
-                url.set_path(uri.path());
-                url.set_query(uri.query());
-
-                if Request::METADATA.requires_authentication {
-                    if let Some(ref session) = *client.session.lock().unwrap() {
-                        url.query_pairs_mut()
-                            .append_pair("access_token", &session.access_token);
-                    } else {
-                        return Err(Error(InnerError::AuthenticationRequired));
-                    }
+            // Convert matrix request to plain http request type
+            // Retrieving the url endpoint from the metadata
+            let mut request = request.try_into()?;
+            let uri = request.uri();
+            url.set_path(uri.path());
+            url.set_query(uri.query());
+            if Request::METADATA.requires_authentication {
+                if let Some(ref session) = *client.session.lock().unwrap() {
+                    url.query_pairs_mut()
+                        .append_pair("access_token", &session.access_token);
+                } else {
+                    return Err(Error(InnerError::AuthenticationRequired));
                 }
             }
+            *request.uri_mut() = Uri::from_str(url.as_ref())?;
 
-            *hyper_request.uri_mut() = Uri::from_str(url.as_ref())?;
-
-            let hyper_response = client.hyper.request(hyper_request).await?;
-            let (head, body) = hyper_response.into_parts();
-
-            // FIXME: We read the response into a contiguous buffer here (not actually required for
-            // deserialization) and then copy the whole thing to convert from Bytes to Vec<u8>.
-            let full_body = hyper::body::to_bytes(body).await?;
-            let full_response = HttpResponse::from_parts(head, full_body.as_ref().to_owned());
-
-            Ok(<Request::Response as Outgoing>::Incoming::try_from(
-                full_response,
-            )?)
+            // Do the actual async request
+            let response = client.http_client.request(request).await?;
+            let ruma_rep = <Request::Response as Outgoing>::Incoming::try_from(response)?;
+            Ok(ruma_rep)
         }
     }
 }
 
-impl<C> Clone for Client<C> {
+impl<C: HttpRequester> Clone for Client<C> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }

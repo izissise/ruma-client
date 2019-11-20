@@ -115,14 +115,17 @@ mod session;
 
 // https://users.rust-lang.org/t/solved-is-it-possible-to-run-async-code-in-a-trait-method-with-stdfuture-async-await/24874/6
 /// The trait for which the implementation will do the actual http request
-pub trait HttpRequester {
+pub trait HttpRequester<B=Vec<u8>>
+where
+    B: Unpin + Send + 'static,
+{
     /// Consume the request
     fn request(
         &self,
-        req: HttpRequest<Vec<u8>>,
+        req: HttpRequest<B>,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<HttpResponse<Vec<u8>>, error::HttpRequesterError>>
+            dyn Future<Output = Result<HttpResponse<B>, error::HttpRequesterError>>
                 + Send
                 + '_,
         >,

@@ -100,6 +100,12 @@ use url::Url;
 
 use crate::error::InnerError;
 
+#[cfg(feature = "hyper_client")]
+pub use hyper_client::HttpClient;
+#[cfg(feature = "tls")]
+pub use hyper_client::HttpsClient;
+
+
 pub use crate::{
     error::{Error, HttpRequesterError},
     session::Session,

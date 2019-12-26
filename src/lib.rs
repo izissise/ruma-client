@@ -92,10 +92,10 @@ use futures_core::{
     future::Future,
     stream::{Stream, TryStream},
 };
+use tower_service::Service;
 use futures_util::stream;
 use http::{Request as HttpRequest, Response as HttpResponse, Uri};
 use ruma_api::{Endpoint, Outgoing};
-use std::pin::Pin;
 use url::Url;
 
 use crate::error::InnerError;
@@ -107,7 +107,7 @@ pub use hyper_client::HttpsClient;
 
 
 pub use crate::{
-    error::{Error, HttpRequesterError},
+    error::Error,
     session::Session,
 };
 pub use ruma_client_api as api;
@@ -119,34 +119,15 @@ pub use ruma_identifiers as identifiers;
 mod error;
 mod session;
 
-// https://users.rust-lang.org/t/solved-is-it-possible-to-run-async-code-in-a-trait-method-with-stdfuture-async-await/24874/6
-/// The trait for which the implementation will do the actual http request
-pub trait HttpRequester<B=Vec<u8>>
-where
-    B: Unpin + Send + 'static,
-{
-    /// Consume the request
-    fn request(
-        &self,
-        req: HttpRequest<B>,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<HttpResponse<B>, error::HttpRequesterError>>
-                + Send
-                + '_,
-        >,
-    >;
-}
-
 /// A client for the Matrix client-server API.
 #[derive(Debug)]
-pub struct Client<C: HttpRequester>(Arc<ClientData<C>>);
+pub struct Client<C: Service<HttpRequest<Vec<u8>>>>(Arc<ClientData<C>>);
 
 /// Data contained in Client's Rc
 #[derive(Debug)]
 struct ClientData<C>
 where
-    C: HttpRequester,
+    C: Service<HttpRequest<Vec<u8>>>,
 {
     /// The URL of the homeserver to connect to.
     homeserver_url: Url,
@@ -156,9 +137,24 @@ where
     session: Mutex<Option<Session>>,
 }
 
+trait TypeEquals {
+    type Other;
+}
+
+impl<T, REQ> TypeEquals for <T as Service<REQ>>::Response {
+    type Other = Self;
+}
+
+impl TypeEquals for HttpResponse<Vec<u8>> {
+    type Other = Self;
+}
+
 impl<C> Client<C>
 where
-    C: HttpRequester + 'static,
+    C: Service<HttpRequest<Vec<u8>>> + 'static,
+    Error: std::convert::From<<C as Service<HttpRequest<Vec<u8>>>>::Error>,
+    <C as Service<HttpRequest<Vec<u8>>>>::Response: TypeEquals<Other= HttpResponse<Vec<u8>>>,
+//     HttpResponse<Vec<u8>>: TypeEquals<Other=<C as Service<HttpRequest<Vec<u8>>>>::Response>,
 {
     /// Creates a new client using the given `HttpRequester`.
     ///
@@ -359,6 +355,8 @@ where
         Request::Incoming: TryFrom<http::Request<Vec<u8>>, Error = ruma_api::Error>,
         <Request::Response as Outgoing>::Incoming:
             TryFrom<http::Response<Vec<u8>>, Error = ruma_api::Error>,
+        <C as Service<HttpRequest<Vec<u8>>>>::Response: TypeEquals<Other= HttpResponse<Vec<u8>>>,
+
     {
         let client = self.0.clone();
 
@@ -382,14 +380,14 @@ where
             *request.uri_mut() = Uri::from_str(url.as_ref())?;
 
             // Do the actual async request
-            let response = client.http_client.request(request).await?;
+            let response = client.http_client.call(request).await?;
             let ruma_rep = <Request::Response as Outgoing>::Incoming::try_from(response)?;
             Ok(ruma_rep)
         }
     }
 }
 
-impl<C: HttpRequester> Clone for Client<C> {
+impl<C: Service<HttpRequest<Vec<u8>>>> Clone for Client<C> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }

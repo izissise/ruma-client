@@ -4,6 +4,7 @@ use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use http::uri::InvalidUri;
+use http::Error as HttpError;
 use ruma_api::Error as RumaApiError;
 use serde_json::Error as SerdeJsonError;
 use serde_urlencoded::ser::Error as SerdeUrlEncodedSerializeError;
@@ -16,7 +17,7 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let message = match self.0 {
             InnerError::AuthenticationRequired => "The queried endpoint requires authentication but was called with an anonymous client.",
-            InnerError::HttpRequester => "An HTTP error occurred.",
+            InnerError::Http(_) => "An HTTP error occurred.",
             InnerError::Uri(_) => "Provided string could not be converted into a URI.",
             InnerError::RumaApi(_) => "An error occurred converting between ruma_client_api and hyper types.",
             InnerError::SerdeJson(_) => "A serialization error occurred.",
@@ -29,29 +30,13 @@ impl Display for Error {
 
 impl StdError for Error {}
 
-/// An error that can occur in the HttpRequester.
-#[derive(Debug, Copy)]
-pub struct HttpRequesterError;
-impl Display for HttpRequesterError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "{}", "HttpRequesterError")
-    }
-}
-
-impl StdError for HttpRequesterError {}
-impl Clone for HttpRequesterError {
-    fn clone(&self) -> Self {
-        Self {}
-    }
-}
-
 /// Internal representation of errors.
 #[derive(Debug)]
 pub(crate) enum InnerError {
     /// Queried endpoint requires authentication but was called on an anonymous client.
     AuthenticationRequired,
     /// An error at the HTTP layer.
-    HttpRequester,
+    Http(HttpError),
     /// An error when parsing a string as a URI.
     Uri(InvalidUri),
     /// An error converting between ruma_client_api types and Hyper types.
@@ -62,9 +47,9 @@ pub(crate) enum InnerError {
     SerdeUrlEncodedSerialize(SerdeUrlEncodedSerializeError),
 }
 
-impl From<HttpRequesterError> for Error {
-    fn from(_error: HttpRequesterError) -> Self {
-        Self(InnerError::HttpRequester)
+impl From<HttpError> for Error {
+    fn from(error: HttpError) -> Self {
+        Self(InnerError::Http(error))
     }
 }
 
